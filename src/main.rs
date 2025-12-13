@@ -1,9 +1,10 @@
 use clap::{Parser, ValueEnum};
-use eros::{Context, ReshapeUnion, TE, Traced, UResult, Union, bail, traced};
+use eros::{Context, ErrorUnion, ReshapeUnion, TE, Traced, UResult, Union};
 use rusb::{Context as LibUsbContext, DeviceHandle, UsbContext};
 use std::cmp::min;
 use std::f64::consts::TAU;
 use std::io::{self, Read};
+use std::num::ParseIntError;
 use std::{thread, time::Duration};
 
 // ==========================================
@@ -147,12 +148,27 @@ enum Mode {
     Static,
 }
 
+fn parse_int_auto(s: &str) -> Result<u16, ParseIntError> {
+    let pairs: [(&str, u32); 3] = [("0x", 16), ("0o", 8), ("0b", 2)];
+    for (prefix, radix) in pairs {
+        if let Some(v) = s.strip_prefix(prefix) {
+            return u16::from_str_radix(v, radix);
+        }
+    }
+
+    s.parse::<u16>()
+}
+
 #[derive(Parser)]
 struct Args {
     #[arg(short, long, value_enum, default_value_t = Mode::Wave)]
     mode: Mode,
     #[arg(short, long, default_value_t = 1.0)]
     brightness: f32,
+    #[arg(long, value_parser = parse_int_auto, default_value_t = 0x05ac)]
+    vid: u16,
+    #[arg(long, value_parser = parse_int_auto, default_value_t = 0x024f)]
+    pid: u16,
 }
 
 fn apply_brightness(r: u8, g: u8, b: u8, factor: f32) -> (u8, u8, u8) {
@@ -173,7 +189,7 @@ fn main() -> UResult<(), (TE<rusb::Error>, TE<io::Error>, TE)> {
     loop {
         println!("Connecting to Infi75...");
 
-        let keyboard = Infi75::new(&context, VID, PID).widen()?;
+        let keyboard = Infi75::new(&context, args.vid, args.pid).widen()?;
 
         // Initial Handshake
         if let Err(e) = keyboard.send_heartbeat() {
@@ -185,14 +201,15 @@ fn main() -> UResult<(), (TE<rusb::Error>, TE<io::Error>, TE)> {
         let mut frame = [(0u8, 0u8, 0u8); MAX_KEYS];
 
         // Run selected mode
-        match args.mode {
-            Mode::Wave => run_wave(&keyboard, &mut frame, args.brightness).union()?,
-            Mode::Cava => run_cava(&keyboard, &mut frame, args.brightness).widen()?,
-            Mode::Static => run_static(&keyboard, &mut frame, args.brightness).union()?,
+        let err: ErrorUnion<(TE<rusb::Error>, TE<io::Error>, TE)> = match args.mode {
+            Mode::Wave => run_wave(&keyboard, &mut frame, args.brightness).union(),
+            Mode::Cava => run_cava(&keyboard, &mut frame, args.brightness).widen(),
+            Mode::Static => run_static(&keyboard, &mut frame, args.brightness).union(),
         }
+        .expect_err("unreachable");
 
         // If run_* returns, it means the connection broke.
-        eprintln!("Connection lost. Rebooting driver...");
+        eprintln!("Connection lost due to {err}. Rebooting driver...");
         thread::sleep(Duration::from_secs(1));
     }
 }
@@ -346,11 +363,11 @@ fn run_cava<T: UsbContext>(
 
             // === COLOR ASSIGNMENT ===
             let (r, g, b) = match row {
-                0 => (255, 0, 0),   // Top Row (Numbers) -> RED
-                1 => (255, 125, 0), // 2nd Row (QWERTY)  -> GREEN
-                2 => (0, 124, 0),   // 2nd Row (QWERTY)  -> GREEN
-                3 => (0, 51, 8),    // 2nd Row (QWERTY)  -> GREEN
-                _ => (0, 50, 16),   // Lower Rows -> GREEN (slightly teal for style)
+                0 => (255, 0, 0),                        // Top Row (Numbers) -> RED
+                1 => (255, 125, 0),                      // 2nd Row (QWERTY)  -> GREEN
+                2 => apply_brightness(0, 255, 0, 0.5),   // 2nd Row (QWERTY)  -> GREEN
+                3 => apply_brightness(0, 255, 80, 0.3),  // 2nd Row (QWERTY)  -> GREEN
+                _ => apply_brightness(0, 255, 160, 0.1), // Lower Rows -> GREEN (slightly teal for style)
             };
 
             // Fade-in brightness
