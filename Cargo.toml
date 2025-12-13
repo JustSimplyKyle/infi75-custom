@@ -1,0 +1,10 @@
+[package]
+name = "infi75-custom"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.53", features = ["derive"] }
+eros = { version = "0.5.0", features = [] }
+hidapi = "2.6.3"
+rusb = "0.9.4"
