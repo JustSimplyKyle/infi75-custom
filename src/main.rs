@@ -7,11 +7,6 @@ use std::io::{self, Read};
 use std::num::ParseIntError;
 use std::{thread, time::Duration};
 
-// ==========================================
-// CONFIGURATION
-// ==========================================
-const VID: u16 = 0x05ac; // Spoofed Apple ID
-const PID: u16 = 0x024f;
 const INTERFACE: u8 = 3;
 
 // Protocol Constants
@@ -22,10 +17,9 @@ const REQUEST_GET_REPORT: u8 = 0x01;
 const VALUE_FEATURE_REPORT: u16 = 0x0300;
 const INDEX_INTERFACE: u16 = 3;
 
-// Limits & Timing
-const MAX_KEYS: usize = 103;
+const MAX_KEYS: usize = 120;
 const CHUNK_SIZE: usize = 16;
-const HEARTBEAT_INTERVAL: u64 = 16; // Send "Enable" packet every 16 frames
+const HEARTBEAT_INTERVAL: u64 = 64; // Sends "Enable" packet 
 
 // ==========================================
 // DRIVER LAYER
@@ -196,6 +190,7 @@ fn main() -> UResult<(), (TE<rusb::Error>, TE<io::Error>, TE)> {
             eprintln!("Init Failed: {e}. Retrying...");
             continue;
         }
+
         println!("Music Mode Active. Starting {:?}...", args.mode);
 
         let mut frame = [(0u8, 0u8, 0u8); MAX_KEYS];
@@ -209,8 +204,8 @@ fn main() -> UResult<(), (TE<rusb::Error>, TE<io::Error>, TE)> {
         .expect_err("unreachable");
 
         // If run_* returns, it means the connection broke.
-        eprintln!("Connection lost due to {err}. Rebooting driver...");
-        thread::sleep(Duration::from_secs(1));
+        eprintln!("Connection lost due to {err:#?}. Rebooting driver...");
+        // thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -277,25 +272,53 @@ fn run_static<T: UsbContext>(
 // Returns None if the key should be ignored (like F-Keys)
 const fn get_vu_coords(key_idx: usize) -> Option<(usize, usize)> {
     match key_idx {
-        // Row 0: F-Keys -> IGNORE (Return None)
-        0..=15 => None,
+        0..=17 => None,
+        18..=35 => Some((key_idx - 18, 0)),
+        36..=48 => Some((key_idx - 36, 1)),
+        52..=65 => Some((key_idx - 52, 2)),
+        72..=82 => Some((key_idx - 72, 3)),
+        100 => Some((12, 3)), // up
+        83 => Some((11, 4)),  // shift
+        90..=99 => Some((key_idx - 90, 4)),
+        // => None,
+        // 66..=70 => None,
+        // 101..=128 => None,
+        0.. => None,
+    }
+    // match key_idx {
+    //     // Row 0: F-Keys -> IGNORE (Return None)
+    //     0..=15 => None,
 
-        // === VISUALIZATION START ===
+    //     // === VISUALIZATION START ===
 
-        // Row 1: Number Row -> VISUAL ROW 0 (The Top / RED Zone)
-        16..=30 => Some((key_idx - 16, 0)),
+    //     // Row 1: Number Row
+    //     16..=30 => Some((key_idx - 16, 0)),
 
-        // Row 2: QWERTY -> VISUAL ROW 1 (Green)
-        31..=45 => Some((key_idx - 31, 1)),
+    //     // Row 2: QWERTY
+    //     31..=39 => Some((key_idx - 31, 1)),
 
-        // Row 3: ASDF -> VISUAL ROW 2 (Green)
-        46..=59 => Some(((key_idx - 46) + 1, 2)),
+    //     // Row 4: ZXCV
+    //     40..=50 => Some(((key_idx - 40), 3)),
 
-        // Row 4: ZXCV -> VISUAL ROW 3 (Green)
-        60..=73 => Some(((key_idx - 60) + 1, 3)),
+    //     // Row 3: ASDF
+    //     51..=73 => Some(((key_idx - 51), 2)),
 
-        // Row 5: Space/Arrows -> VISUAL ROW 4 (Green/Base)
-        74.. => Some(((key_idx - 74) + 2, 4)),
+    //     // Row 5: Space/Arrows
+    //     74.. => Some(((key_idx - 74), 4)),
+    // }
+}
+
+fn get_gradient_color(intensity: f32) -> (u8, u8, u8) {
+    // intensity 0.0 to 1.0
+    // Cold (Blue) -> Medium (Green) -> Hot (Red)
+    if intensity < 0.5 {
+        // Blue to Green
+        let t = intensity * 2.0;
+        (0, (255.0 * t) as u8, (255.0 * (1.0 - t)) as u8)
+    } else {
+        // Green to Red
+        let t = (intensity - 0.5) * 2.0;
+        ((255.0 * t) as u8, (255.0 * (1.0 - t)) as u8, 0)
     }
 }
 
@@ -305,7 +328,6 @@ fn run_cava<T: UsbContext>(
     _global_brightness: f32,
 ) -> UResult<(), (TE<rusb::Error>, TE<io::Error>)> {
     const BAR_COUNT: usize = 16;
-    const SMOOTHING: f32 = 0.4;
 
     let mut buffer = [0u8; BAR_COUNT];
     let mut smooth_buffer = [0.0f32; BAR_COUNT];
@@ -325,17 +347,50 @@ fn run_cava<T: UsbContext>(
         // 1. Physics & Smoothing
         for i in 0..BAR_COUNT {
             let raw_val = f32::from(buffer[i]);
-            if raw_val > smooth_buffer[i] {
-                smooth_buffer[i] = raw_val;
-            } else {
-                smooth_buffer[i] -= (smooth_buffer[i] - raw_val) * (1.0 - SMOOTHING);
-            }
+            smooth_buffer[i] = raw_val;
         }
 
         // 2. Render Frame
         for (key_idx, key) in frame.iter_mut().enumerate() {
+            if key_idx <= 15 {
+                let amp = smooth_buffer[13];
+
+                // Calculate the "Radius" of the pulse (0.0 to 8.5)
+                // We divide by ~220.0 to hit max width before clipping for better visual impact
+                let pulse_length = (amp / 220.0) * 15.;
+
+                if amp < 10. {
+                    *key = (0, 0, 0);
+                    continue;
+                }
+
+                match key_idx {
+                    0..2 => {
+                        *key = apply_brightness(0, 255, 255, 0.5);
+                    }
+                    2..4 => {
+                        *key = apply_brightness(255, 255, 0, 0.7);
+                    }
+                    4..7 => {
+                        *key = apply_brightness(0, 255, 0, 1.0);
+                    }
+                    7..9 => {
+                        *key = apply_brightness(255, 40, 40, 1.0);
+                    }
+                    9.. => {
+                        *key = apply_brightness(255, 0, 0, 1.0);
+                    }
+                }
+
+                // If the key is outside the current pulse length, turn it off
+                if (key_idx as f32) > pulse_length {
+                    *key = (0, 0, 0);
+                }
+                continue;
+            }
+            // ===========================================
+
             let Some((col, row)) = get_vu_coords(key_idx) else {
-                // If it's an F-Key (None), turn it off and skip logic
                 *key = (0, 0, 0);
                 continue;
             };
@@ -343,38 +398,31 @@ fn run_cava<T: UsbContext>(
             // Map key to visual coordinates
             let col_idx = min(col, BAR_COUNT - 1);
             let amp = smooth_buffer[col_idx];
-
-            // === THRESHOLDS ===
-            // We now have 5 Visual Rows (0=Top/Numbers, 4=Bottom/Space)
-            // The thresholds determine how much volume is needed to light up that row.
+            // // === THRESHOLDS ===
             let threshold = match row {
-                0 => 180.0, // Number Row (RED) - Needs loud volume
-                1 => 140.0, // QWERTY (Green)
+                0 => 180.0, // Number Row
+                1 => 140.0, // QWERTY
                 2 => 90.0,  // ASDF
                 3 => 60.0,  // ZXCV
-                _ => 20.0,  // Space (Always on if sound exists)
+                _ => 20.0,  // Space
             };
 
+            // // Normalize current row threshold against max amp
+            // let row_intensity = threshold / 255.;
+
             if amp <= threshold {
-                // Background (Off)
                 *key = (0, 0, 0);
                 continue;
             }
 
-            // === COLOR ASSIGNMENT ===
             let (r, g, b) = match row {
-                0 => (255, 0, 0),                        // Top Row (Numbers) -> RED
-                1 => (255, 125, 0),                      // 2nd Row (QWERTY)  -> GREEN
-                2 => apply_brightness(0, 255, 0, 0.5),   // 2nd Row (QWERTY)  -> GREEN
-                3 => apply_brightness(0, 255, 80, 0.3),  // 2nd Row (QWERTY)  -> GREEN
-                _ => apply_brightness(0, 255, 160, 0.1), // Lower Rows -> GREEN (slightly teal for style)
+                0 => (0, 255, 255),
+                1 => (255, 180, 180),
+                2 => (255, 225, 0),
+                3 => (0, 255, 0),
+                _ => (255, 0, 0),
             };
-
-            // Fade-in brightness
-            let over_threshold = amp - threshold;
-            let brightness = (over_threshold / 40.0).clamp(0.2, 1.0);
-
-            *key = apply_brightness(r, g, b, brightness);
+            *key = apply_brightness(r, g, b, 1.0);
         }
 
         kb.send_frame(frame).union()?;
@@ -382,6 +430,7 @@ fn run_cava<T: UsbContext>(
         if frame_count % HEARTBEAT_INTERVAL == 0 {
             kb.send_heartbeat().union()?;
         }
+
         frame_count += 1;
     }
 }
