@@ -1,10 +1,16 @@
 use clap::{Parser, ValueEnum};
 use eros::{Context, ErrorUnion, ReshapeUnion, TE, Traced, UResult, Union};
+use itermore::prelude::*;
+use log::{info, trace, warn};
+use retry::delay::Fixed;
 use rusb::{Context as LibUsbContext, DeviceHandle, UsbContext};
 use std::cmp::min;
 use std::f64::consts::TAU;
 use std::io::{self, Read};
 use std::num::ParseIntError;
+use std::process::exit;
+use std::thread::yield_now;
+use std::time::Instant;
 use std::{thread, time::Duration};
 
 const INTERFACE: u8 = 3;
@@ -18,7 +24,7 @@ const VALUE_FEATURE_REPORT: u16 = 0x0300;
 const INDEX_INTERFACE: u16 = 3;
 
 const MAX_KEYS: usize = 120;
-const CHUNK_SIZE: usize = 16;
+const RETRY_INTERVAL: Duration = Duration::from_millis(5);
 const HEARTBEAT_INTERVAL: u64 = 64; // Sends "Enable" packet 
 
 // ==========================================
@@ -37,14 +43,9 @@ impl<T: UsbContext> Infi75<T> {
             .union()?
             .iter()
             .find_map(|d| {
-                let Ok(desc) = d.device_descriptor() else {
-                    return None;
-                };
-                if desc.vendor_id() == vid && desc.product_id() == pid {
-                    Some(d)
-                } else {
-                    None
-                }
+                d.device_descriptor()
+                    .is_ok_and(|desc| desc.vendor_id() == vid && desc.product_id() == pid)
+                    .then_some(d)
             })
             .context("Usb device not found")
             .union()?;
@@ -75,7 +76,7 @@ impl<T: UsbContext> Infi75<T> {
     }
 
     fn send_packet(&self, data: &[u8]) -> Result<(), TE<rusb::Error>> {
-        let timeout = Duration::from_millis(100);
+        const TIMEOUT: Duration = Duration::from_millis(200);
         self.handle
             .write_control(
                 REQUEST_TYPE_WRITE,
@@ -83,7 +84,7 @@ impl<T: UsbContext> Infi75<T> {
                 VALUE_FEATURE_REPORT,
                 INDEX_INTERFACE,
                 data,
-                timeout,
+                TIMEOUT,
             )
             .map(|_| ())
             .traced()
@@ -91,43 +92,38 @@ impl<T: UsbContext> Infi75<T> {
     }
 
     /// Reads status to keep the USB pipe clean and prevent stalls
-    fn drain_status(&self) {
+    /// It will return `Err` if the device is currently busy, most of the time it's safe to discard.
+    fn drain_status(&self) -> Result<usize, rusb::Error> {
         let mut buffer = [0u8; 64];
-        let _ = self.handle.read_control(
+        self.handle.read_control(
             REQUEST_TYPE_READ,
             REQUEST_GET_REPORT,
             VALUE_FEATURE_REPORT,
             INDEX_INTERFACE,
             &mut buffer,
             Duration::from_millis(10),
-        );
+        )
     }
 
     fn send_frame(&self, colors: &[(u8, u8, u8); MAX_KEYS]) -> Result<(), TE<rusb::Error>> {
-        let mut key_index = 1;
-        while key_index <= MAX_KEYS {
-            let mut buffer = [0u8; 64];
-            for i in 0..CHUNK_SIZE {
-                if key_index > MAX_KEYS {
-                    break;
-                }
-                let (r, g, b) = colors[key_index - 1];
-                let pos = i * 4;
-                buffer[pos] = key_index as u8;
-                buffer[pos + 1] = r;
-                buffer[pos + 2] = g;
-                buffer[pos + 3] = b;
-                key_index += 1;
+        const PACKET_SIZE: usize = 64;
+
+        let mut byte_stream = colors
+            .iter()
+            .enumerate()
+            .flat_map(|(key, &(r, g, b))| [key as u8 + 1, r, g, b]);
+
+        while let Some(packets) = match byte_stream.next_array::<PACKET_SIZE>() {
+            Ok(full) => Some(full),
+            Err(rem) if rem.len() == 0 => None,
+            Err(mut rem) => Some(std::array::from_fn(|_| rem.next().unwrap_or(0))),
+        } {
+            self.send_packet(&packets)?;
+
+            if let Err(e) = self.drain_status() {
+                trace!("fails to drain status due to: {e}");
             }
-
-            self.send_packet(&buffer)
-                .context("failed to send frame data")?;
-            key_index += 1;
         }
-
-        // Read status once per frame to sync with the device
-        self.drain_status();
-
         Ok(())
     }
 }
@@ -173,15 +169,25 @@ fn apply_brightness(r: u8, g: u8, b: u8, factor: f32) -> (u8, u8, u8) {
     )
 }
 
-fn main() -> UResult<(), (TE<rusb::Error>, TE<io::Error>, TE)> {
+fn main() {
+    match real_main() {
+        Ok(_) => { unreachable!() },
+        Err(x) => {
+            eprintln!("Error: \n {x:#?}");
+            exit(1);
+        },
+    }
+}
+
+fn real_main() -> Result<(), ErrorUnion<(eros::TracedError<rusb::Error>, eros::TracedError<io::Error>, eros::TracedError)>> {
     let args = Args::parse();
     let context = LibUsbContext::new()
         .traced()
         .context("failed to start usb context")
         .union()?;
-
+    env_logger::init();
     loop {
-        println!("Connecting to Infi75...");
+        info!("Connecting to Infi75...");
 
         let keyboard = Infi75::new(&context, args.vid, args.pid).widen()?;
 
@@ -191,7 +197,7 @@ fn main() -> UResult<(), (TE<rusb::Error>, TE<io::Error>, TE)> {
             continue;
         }
 
-        println!("Music Mode Active. Starting {:?}...", args.mode);
+        info!("Music Mode Active. Starting {:?}...", args.mode);
 
         let mut frame = [(0u8, 0u8, 0u8); MAX_KEYS];
 
@@ -201,11 +207,11 @@ fn main() -> UResult<(), (TE<rusb::Error>, TE<io::Error>, TE)> {
             Mode::Cava => run_cava(&keyboard, &mut frame, args.brightness).widen(),
             Mode::Static => run_static(&keyboard, &mut frame, args.brightness).union(),
         }
-        .expect_err("unreachable");
+        .expect_err(
+            "If run_* returns, it meant the connection broke; therefore this is unreachable",
+        );
 
-        // If run_* returns, it means the connection broke.
-        eprintln!("Connection lost due to {err:#?}. Rebooting driver...");
-        // thread::sleep(Duration::from_secs(1));
+        warn!("Connection lost due to {err:#?}. Rebooting driver...");
     }
 }
 
@@ -285,27 +291,6 @@ const fn get_vu_coords(key_idx: usize) -> Option<(usize, usize)> {
         // 101..=128 => None,
         0.. => None,
     }
-    // match key_idx {
-    //     // Row 0: F-Keys -> IGNORE (Return None)
-    //     0..=15 => None,
-
-    //     // === VISUALIZATION START ===
-
-    //     // Row 1: Number Row
-    //     16..=30 => Some((key_idx - 16, 0)),
-
-    //     // Row 2: QWERTY
-    //     31..=39 => Some((key_idx - 31, 1)),
-
-    //     // Row 4: ZXCV
-    //     40..=50 => Some(((key_idx - 40), 3)),
-
-    //     // Row 3: ASDF
-    //     51..=73 => Some(((key_idx - 51), 2)),
-
-    //     // Row 5: Space/Arrows
-    //     74.. => Some(((key_idx - 74), 4)),
-    // }
 }
 
 fn get_gradient_color(intensity: f32) -> (u8, u8, u8) {
@@ -322,6 +307,47 @@ fn get_gradient_color(intensity: f32) -> (u8, u8, u8) {
     }
 }
 
+pub struct MuteController {
+    instant: Option<Instant>,
+    timeout: Duration,
+}
+
+impl MuteController {
+    /// Call this every frame with the current silence status
+    pub fn update(&mut self, is_muted: bool) {
+        if is_muted {
+            self.enable();
+        } else {
+            self.disable();
+        }
+    }
+
+    #[must_use]
+    /// Returns true if we have been muted longer than the timeout
+    pub fn is_timeout(&self) -> bool {
+        self.muted_duration() > self.timeout
+    }
+
+    pub fn new(timeout: impl Into<Option<Duration>>) -> Self {
+        Self {
+            instant: None,
+            timeout: timeout.into().unwrap_or(Duration::from_secs(3)),
+        }
+    }
+
+    const fn disable(&mut self) {
+        self.instant = None;
+    }
+    fn enable(&mut self) {
+        if self.instant.is_none() {
+            self.instant = Some(Instant::now());
+        }
+    }
+    fn muted_duration(&self) -> Duration {
+        self.instant.map(|x| x.elapsed()).unwrap_or_default()
+    }
+}
+
 fn run_cava<T: UsbContext>(
     kb: &Infi75<T>,
     frame: &mut [(u8, u8, u8); MAX_KEYS],
@@ -334,8 +360,10 @@ fn run_cava<T: UsbContext>(
 
     let stdin = io::stdin();
 
-    println!("Listening on STDIN");
+    info!("Listening on STDIN");
     let mut frame_count = 0;
+
+    let mut muted_controller = MuteController::new(None);
 
     loop {
         let value = stdin.lock().read_exact(&mut buffer);
@@ -343,6 +371,13 @@ fn run_cava<T: UsbContext>(
             .traced()
             .context("failed to read from stdin")
             .union()?;
+
+        muted_controller.update(u128::from_ne_bytes(buffer) == 0);
+
+        if muted_controller.is_timeout() {
+            trace!("no sound for 3 seconds, skipping loop");
+            continue;
+        }
 
         // 1. Physics & Smoothing
         for i in 0..BAR_COUNT {
@@ -407,9 +442,6 @@ fn run_cava<T: UsbContext>(
                 _ => 20.0,  // Space
             };
 
-            // // Normalize current row threshold against max amp
-            // let row_intensity = threshold / 255.;
-
             if amp <= threshold {
                 *key = (0, 0, 0);
                 continue;
@@ -425,7 +457,15 @@ fn run_cava<T: UsbContext>(
             *key = apply_brightness(r, g, b, 1.0);
         }
 
-        kb.send_frame(frame).union()?;
+        retry::retry(Fixed::from(RETRY_INTERVAL).take(3), || kb.send_frame(frame))
+            .map_err(|x| {
+                x.error.context(format!(
+                    "retried {} times in {}ms",
+                    x.tries,
+                    x.total_delay.as_millis(),
+                ))
+            })
+            .union()?;
 
         if frame_count % HEARTBEAT_INTERVAL == 0 {
             kb.send_heartbeat().union()?;
